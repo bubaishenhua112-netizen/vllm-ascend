@@ -27,6 +27,10 @@ from vllm.distributed import get_dp_group, get_ep_group, get_tp_group, tensor_mo
 from vllm.forward_context import get_forward_context
 from vllm.logger import logger
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
+from vllm.model_executor.layers.fused_moe.layer import (
+    FusedMoE,  # noqa: F401
+    MoERunner,
+)
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
@@ -49,12 +53,8 @@ from vllm_ascend.utils import (
 )
 
 if vllm_version_is("0.23.0"):
-    from vllm.model_executor.layers.fused_moe.layer import FusedMoE, UnquantizedFusedMoEMethod  # noqa: F401
-    from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner  # type: ignore
+    from vllm.model_executor.layers.fused_moe.layer import UnquantizedFusedMoEMethod
 else:
-    from vllm.model_executor.layers.fused_moe.layer import (
-        MoERunner,
-    )
     from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import UnquantizedFusedMoEMethod
 
 
@@ -112,11 +112,18 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
     def process_weights_after_loading(self, layer):
         super(UnquantizedFusedMoEMethod, self).process_weights_after_loading(layer)
 
-        w13_data = self._maybe_pad_weight(layer.w13_weight.data).transpose(1, 2).contiguous()
-        layer.w13_weight = torch.nn.Parameter(w13_data, requires_grad=False)
+        if not vllm_version_is("0.23.0"):
+            w13_data = self._maybe_pad_weight(layer.w13_weight.data).transpose(1, 2)
+            layer.w13_weight = torch.nn.Parameter(w13_data, requires_grad=False)
 
-        w2_data = self._maybe_pad_weight(layer.w2_weight.data).transpose(1, 2).contiguous()
-        layer.w2_weight = torch.nn.Parameter(w2_data, requires_grad=False)
+            w2_data = self._maybe_pad_weight(layer.w2_weight.data).transpose(1, 2)
+            layer.w2_weight = torch.nn.Parameter(w2_data, requires_grad=False)
+        else:
+            w13_data = self._maybe_pad_weight(layer.w13_weight.data).transpose(1, 2).contiguous()
+            layer.w13_weight = torch.nn.Parameter(w13_data, requires_grad=False)
+
+            w2_data = self._maybe_pad_weight(layer.w2_weight.data).transpose(1, 2).contiguous()
+            layer.w2_weight = torch.nn.Parameter(w2_data, requires_grad=False)
 
         # TODO: Current dispatch_ffn_combine fusion operator ONLY supports NZ format.
         # Therefore, we must cast weights to NZ when fusion is enabled.
@@ -183,19 +190,18 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             tid2eid=self.tid2eid,
             input_ids=input_ids,
         )
-        if not vllm_version_is("0.23.0"):
+        if vllm_version_is("0.23.0"):
+            model_config = layer.vllm_config.model_config
+        else:
             try:
                 _vllm_config = get_current_vllm_config()
             except AssertionError:
                 _vllm_config = None
-            if (
-                _vllm_config is not None
-                and _vllm_config.model_config is not None
-                and _vllm_config.model_config.enable_return_routed_experts
-            ):
-                capturer = getattr(layer, "_ascend_routed_experts_capturer", None)
-                if capturer is not None:
-                    capturer.capture(layer_id=layer.layer_id, topk_ids=topk_ids)
+            model_config = None if _vllm_config is None else _vllm_config.model_config
+        if model_config is not None and model_config.enable_return_routed_experts:
+            capturer = getattr(layer, "_ascend_routed_experts_capturer", None)
+            if capturer is not None:
+                capturer.capture(layer_id=layer.layer_id, topk_ids=topk_ids)
 
         if zero_expert_num > 0 and zero_expert_type is not None:
             topk_ids, topk_weights, zero_expert_result = zero_experts_compute(
@@ -342,9 +348,6 @@ else:
                 )
 
             self.quant_type = self._get_quant_type()
-            # Can be removed after vllm fixes the issue.
-            if self._needs_routed_expert_parameter_aliases():
-                self._register_routed_expert_parameter_aliases()
 
             self.moe_config.tp_group = get_tp_group()
             self.moe_config.dp_group = get_dp_group()
@@ -495,51 +498,6 @@ else:
                 quant_type = getattr(method, "quant_type", QuantType.NONE)
 
             return quant_type
-
-        def _register_routed_expert_parameter_aliases(self) -> None:
-            alias_names = []
-            for name, param in self.routed_experts.named_parameters(recurse=False):
-                alias_param = torch.nn.Parameter(param.data, requires_grad=param.requires_grad)
-                alias_param.__dict__.update(param.__dict__)
-                self.register_parameter(name, alias_param)
-                alias_names.append(name)
-
-            original_process_weights = self._quant_method.process_weights_after_loading
-
-            @wraps(original_process_weights)
-            def wrapped_process_weights(layer, *args, **kwargs):
-                for name in alias_names:
-                    self._parameters.pop(name, None)
-                return original_process_weights(layer, *args, **kwargs)
-
-            self._quant_method.process_weights_after_loading = wrapped_process_weights  # type: ignore[method-assign]
-
-        def _needs_routed_expert_parameter_aliases(self) -> bool:
-            # test_gpt_oss_distributed_tp2
-            # test_qwen3_moe_routing_replay[Qwen/Qwen3.5-35B-A3B]
-            # test_multimodal_reasoning_pp_full_decode_only
-            vllm_config = get_current_vllm_config()
-            hf_config = getattr(vllm_config.model_config, "hf_config", None)
-            model_type = getattr(hf_config, "model_type", None)
-            architectures = getattr(hf_config, "architectures", ()) or ()
-            if model_type in {"qwen3_5_mtp", "step3p5_mtp"} or set(architectures) & {
-                "Qwen3_5MoeMTP",
-                "Step3p5MTP",
-            }:
-                return False
-            if self.layer_name.startswith("mtp.") or ".mtp." in self.layer_name:
-                return False
-            return model_type in {
-                "aria",
-                "aria_text",
-                "gpt_oss",
-                "qwen3_5_moe",
-                "qwen3_vl_moe",
-                "qwen3_vl_moe_text",
-                "step3_text",
-                "step3_vl",
-                "step3p5",
-            }
 
         @property
         def is_internal_router(self) -> bool:
